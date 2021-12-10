@@ -49,7 +49,6 @@ Episode Termination:
 
 class CartPoleAgent:
     def __init__(self, epsilon: float = 0.1, gamma: float = 0.9):
-        # self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.prediction_net = self.create_neural_net().eval()
         self.target_net = copy.deepcopy(self.prediction_net).eval()
         self.epsilon = epsilon
@@ -105,7 +104,7 @@ class CartPoleAgent:
         action_tensor[action] = 1
         state_ = torch.from_numpy(state)
         tensor = torch.cat((state_, action_tensor), dim=0)
-        return tensor
+        return tensor.float()
 
     def _normalize(self, state: np.ndarray):
         state[0] = (state[0] + 4.8) / 9.6
@@ -124,43 +123,43 @@ class CartPoleAgent:
 
 
 def train(env: gym.Env, agent: CartPoleAgent, num_episodes=20000):
-    optimizer = optim.Adam(agent.prediction_net.parameters(), lr=0.001)
-    criterion = nn.MSELoss()
+    optimizer = optim.RMSprop(agent.prediction_net.parameters(), lr=0.001)
+    criterion = nn.SmoothL1Loss()
     with agent.enable_train_mode():
-        rewards = []
-        iters = []
-        losses = []
-        for iter_num in tqdm.tqdm(range(1, num_episodes + 1)):
-            if iter_num % 50 == 0:
-                agent.target_net = copy.deepcopy(agent.prediction_net)
+        rewards = [0]
+        iters = [0]
+        losses = [0]
+        for iter_num in tqdm.tqdm(
+            range(1, num_episodes + 1), desc="Train Loss: {:2.10f}".format(losses[-1])
+        ):
+            if iter_num % 10 == 0:
+                agent.target_net.load_state_dict(agent.prediction_net.state_dict())
             done = False
-            env.reset()
-            env.state = np.asarray([random.uniform(-0.05, 0.05) for _ in range(4)])
-            state = env.state
+            old_states = []
+            actions = []
+            targets = []
+            state = env.reset()
             total_reward = 0
             while not done:
                 # environment interaction
-                optimizer.zero_grad()
-                action = agent.epsilon_greedy(state)
                 old_state = state.copy()
+                action = agent.epsilon_greedy(state)
                 state, reward, done, _ = env.step(action)
-                best_next_value = agent.get_max_value_action(old_state)
+                best_next_value = agent.get_max_value_action(state)
 
-                # if type(env.steps_beyond_done) == int:
-                #    done = env.steps_beyond_done > 100
-                # creating the target
                 if done:
                     y_target = reward
                 else:
                     y_target = reward + agent.gamma * best_next_value
 
                 y_target = torch.FloatTensor([y_target])
+                prediction = agent.calculate_prediction_q_value(old_state, action)
                 total_reward += reward
-                loss = criterion(
-                    agent.calculate_prediction_q_value(old_state, action), y_target
-                )
+                loss = criterion(prediction, y_target)
                 loss.backward()
+                print(y_target, prediction, loss)
                 optimizer.step()
+                optimizer.zero_grad()
 
             iters.append(iter_num)
             rewards.append(total_reward)
@@ -180,6 +179,7 @@ def demonstrate(env: gym.Env, agent: CartPoleAgent):
             done = False
             np.random.seed(random.randint(0, 10000))
             state = env.reset()
+            print(state)
             while not done:
                 env.render()
                 action = agent._get_max_value_action(state)
@@ -194,11 +194,11 @@ def demonstrate(env: gym.Env, agent: CartPoleAgent):
 def main():
     environment = gym.make("CartPole-v0")
     agent = CartPoleAgent()
-    # demonstrate(environment, agent)
-    # train(environment, agent)
-    # agent.save_weights()
-    agent.prediction_net.load_state_dict(torch.load("../weights/cart_pole_ann.pth"))
-    agent.target_net.load_state_dict(torch.load("../weights/cart_pole_ann.pth"))
+    demonstrate(environment, agent)
+    train(environment, agent)
+    agent.save_weights()
+    # agent.prediction_net.load_state_dict(torch.load("../weights/cart_pole_ann.pth"))
+    # agent.target_net.load_state_dict(torch.load("../weights/cart_pole_ann.pth"))
     demonstrate(environment, agent)
 
 
