@@ -1,14 +1,13 @@
 from os import environ, stat
 import gym
-import copy
 import tqdm
 import time
 import torch
 import random
-import operator
 import numpy as np
 import torch.nn as nn
 import torch.optim as optim
+import torch.functional as func
 import matplotlib.pyplot as plt
 
 from contextlib import contextmanager
@@ -48,63 +47,63 @@ Episode Termination:
 
 
 class CartPoleAgent:
+    state = None
+    q_values = None
+    next_q_values = None
+    action = None
+
     def __init__(self, epsilon: float = 0.1, gamma: float = 0.9):
-        self.prediction_net = self.create_neural_net().eval()
-        self.target_net = copy.deepcopy(self.prediction_net).eval()
+        self.policy_net = self.create_neural_net()
+        self.target_net = self.create_neural_net().eval()
+        self.target_net.load_state_dict(self.policy_net.state_dict())
         self.epsilon = epsilon
         self.gamma = gamma
 
     def create_neural_net(self) -> nn.Module:
         return nn.Sequential(
-            nn.Linear(6, 128),
+            nn.Linear(4, 128),
             nn.ReLU(),
             nn.Linear(128, 256),
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(128, 1),
-            nn.Sigmoid(),
+            nn.Linear(128, 2),
         )
 
-    def calculate_prediction_q_value(self, state: np.ndarray, action: int):
-        tensor = self._create_state_action_vector(state, action)
-        return self.prediction_net(tensor)
+    def get_policy_result(self, state: np.ndarray) -> torch.Tensor:
+        tensor = torch.from_numpy(state)
+        tensor[..., 1] = torch.tanh(tensor[..., 1])
+        tensor[..., 3] = torch.tanh(tensor[..., 3])
+        # print("Policy input -> {}".format(tensor))
+        return self.policy_net(tensor)
 
-    def calculate_target_q_value(self, state: np.ndarray, action: int):
-        tensor = self._create_state_action_vector(state, action)
+    def get_target_result(self, state: np.ndarray) -> torch.Tensor:
+        tensor = torch.from_numpy(state)
+        tensor[..., 1] = torch.tanh(tensor[..., 1])
+        tensor[..., 3] = torch.tanh(tensor[..., 3])
+        # print("Target input -> {}".format(tensor))
         return self.target_net(tensor)
 
-    def get_max_value_action(self, state: np.ndarray) -> torch.Tensor:
-        q_values = []
-        for action in range(2):
-            q_values.append(self.calculate_target_q_value(state, action))
-        _, max_value = max(enumerate(q_values), key=operator.itemgetter(1))
+    def get_best_value_from_target(self, state: np.ndarray) -> torch.Tensor:
+        q_values = self.get_target_result(state)
+        max_value = torch.max(q_values)
         return max_value
 
-    def _get_max_value_action(self, state: np.ndarray) -> int:
-        q_values = []
-        for action in range(2):
-            q_values.append(self.calculate_prediction_q_value(state, action))
-        action, _ = max(enumerate(q_values), key=operator.itemgetter(1))
-        return action
+    def get_best_action(self, state: np.ndarray) -> torch.Tensor:
+        q_values = self.get_policy_result(state)
+        best_action = torch.argmax(q_values, dim=-1)
+        return best_action
 
     def epsilon_greedy(self, state: np.ndarray, step_number: int = 1) -> int:
         if random.random() < self.epsilon / step_number:
             return round(random.random())
         else:
-            state = self._normalize(state)
-            action = self._get_max_value_action(state)
+            with torch.no_grad():
+                action = self.get_best_action(state).item()
             return action
 
     def save_weights(self):
-        torch.save(self.prediction_net.state_dict(), "../weights/cart_pole_ann.pth")
-
-    def _create_state_action_vector(self, state: np.ndarray, action: int):
-        action_tensor = torch.zeros(2)
-        action_tensor[action] = 1
-        state_ = torch.from_numpy(state)
-        tensor = torch.cat((state_, action_tensor), dim=0)
-        return tensor.float()
+        torch.save(self.policy_net.state_dict(), "../weights/cart_pole_ann.pth")
 
     def _normalize(self, state: np.ndarray):
         state[0] = (state[0] + 4.8) / 9.6
@@ -116,61 +115,60 @@ class CartPoleAgent:
     @contextmanager
     def enable_train_mode(self):
         try:
-            self.prediction_net = self.prediction_net.train(True)
+            self.policy_net = self.policy_net.train(True)
             yield
         finally:
-            self.prediction_net = self.prediction_net.train(False)
+            self.policy_net = self.policy_net.train(False)
 
 
 def train(env: gym.Env, agent: CartPoleAgent, num_episodes=20000):
-    optimizer = optim.RMSprop(agent.prediction_net.parameters(), lr=0.001)
+    # optimizer = optim.RMSprop(agent.prediction_net.parameters(), lr=0.001)
+    # criterion = nn.SmoothL1Loss()
+    optimizer = optim.Adam(agent.policy_net.parameters(), lr=0.001)
     criterion = nn.SmoothL1Loss()
-    with agent.enable_train_mode():
-        rewards = [0]
-        iters = [0]
-        losses = [0]
-        for iter_num in tqdm.tqdm(
-            range(1, num_episodes + 1), desc="Train Loss: {:2.10f}".format(losses[-1])
-        ):
-            if iter_num % 10 == 0:
-                agent.target_net.load_state_dict(agent.prediction_net.state_dict())
-            done = False
-            old_states = []
-            actions = []
-            targets = []
-            state = env.reset()
-            total_reward = 0
-            while not done:
-                # environment interaction
-                old_state = state.copy()
-                action = agent.epsilon_greedy(state)
-                state, reward, done, _ = env.step(action)
-                best_next_value = agent.get_max_value_action(state)
 
-                if done:
-                    y_target = reward
-                else:
-                    y_target = reward + agent.gamma * best_next_value
+    try:
+        with agent.enable_train_mode():
+            losses = [0]
+            avg_loss = 0.0
+            avg_iter = 0
+            bar = tqdm.tqdm(range(1, num_episodes + 1))
+            for iter_num in bar:
+                if iter_num % 10 == 0:
+                    agent.target_net.load_state_dict(agent.policy_net.state_dict())
+                done = False
+                state = env.reset()
+                total_reward = 0
+                while not done:
+                    old_state = state.copy()
+                    action = agent.epsilon_greedy(old_state)
+                    state, reward, done, _ = env.step(action)
+                    best_next_value = agent.get_best_value_from_target(state).item()
 
-                y_target = torch.FloatTensor([y_target])
-                prediction = agent.calculate_prediction_q_value(old_state, action)
-                total_reward += reward
-                loss = criterion(prediction, y_target)
-                loss.backward()
-                print(y_target, prediction, loss)
-                optimizer.step()
-                optimizer.zero_grad()
+                    if done:
+                        y_target = -1
+                    else:
+                        y_target = reward + agent.gamma * best_next_value
 
-            iters.append(iter_num)
-            rewards.append(total_reward)
-            losses.append(loss.detach().item())
-    plt.plot(iters, losses)
-    plt.show()
-
-    plt.clf()
-    plt.plot(iters, rewards)
-    plt.show()
-    env.close()
+                    y_target = torch.FloatTensor([y_target])
+                    prediction = torch.max(agent.get_policy_result(old_state))
+                    total_reward += reward
+                    loss = criterion(prediction, y_target)
+                    loss.backward()
+                    avg_loss += loss.item()
+                    avg_iter += 1
+                    # print(y_target, prediction, loss)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    losses.append(loss.detach().item())
+                bar.set_description("Loss -> {:2.10f}".format(avg_loss / avg_iter))
+        plt.plot(losses)
+        plt.show()
+        env.close()
+    except KeyboardInterrupt:
+        plt.plot(losses)
+        plt.show()
+        env.close()
 
 
 def demonstrate(env: gym.Env, agent: CartPoleAgent):
@@ -182,7 +180,7 @@ def demonstrate(env: gym.Env, agent: CartPoleAgent):
             print(state)
             while not done:
                 env.render()
-                action = agent._get_max_value_action(state)
+                action = torch.argmax(agent.get_policy_result(state)).item()
                 state, reward, _, info = env.step(action)
                 if type(env.steps_beyond_done) == int:
                     done = env.steps_beyond_done > 100
@@ -194,10 +192,10 @@ def demonstrate(env: gym.Env, agent: CartPoleAgent):
 def main():
     environment = gym.make("CartPole-v0")
     agent = CartPoleAgent()
-    demonstrate(environment, agent)
-    train(environment, agent)
-    agent.save_weights()
-    # agent.prediction_net.load_state_dict(torch.load("../weights/cart_pole_ann.pth"))
+    # demonstrate(environment, agent)
+    # train(environment, agent)
+    # agent.save_weights()
+    agent.policy_net.load_state_dict(torch.load("../weights/cart_pole_ann.pth"))
     # agent.target_net.load_state_dict(torch.load("../weights/cart_pole_ann.pth"))
     demonstrate(environment, agent)
 
