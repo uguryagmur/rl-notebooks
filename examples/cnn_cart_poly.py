@@ -1,16 +1,14 @@
 from os import environ, stat
 import gym
-import copy
-from torch.nn.modules.activation import ReLU
-from torch.nn.modules.flatten import Flatten
+from torch.nn.modules.activation import LeakyReLU
 import tqdm
 import time
 import torch
 import random
-import operator
 import numpy as np
 import torch.nn as nn
 import torch.optim as optim
+import torch.functional as func
 import matplotlib.pyplot as plt
 
 from contextlib import contextmanager
@@ -49,162 +47,131 @@ Episode Termination:
 """
 
 
-class AgentNet(nn.Module):
-    def __init__(self, device: torch.device) -> None:
-        super().__init__()
-        self.device = device
-        self.base = self._create_conv_base()
-        self.head = self._create_head()
-
-    def forward(self, screen: torch.Tensor, action: torch.Tensor):
-        screen /= 255.0
-        dense_out = self.base(screen.to(self.device))
-        dense_out = torch.cat((dense_out, action.to(self.device)), dim=1)
-        output = self.head(dense_out)
-        return output
-
-    @staticmethod
-    def _create_conv_base():
-        return nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=5, stride=2),
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=5, stride=2),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Conv2d(32, 32, kernel_size=5, stride=2),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
-
-    @staticmethod
-    def _create_head():
-        return nn.Sequential(
-            nn.Linear(108289, 4), nn.ReLU(), nn.Linear(4, 1), nn.Sigmoid()
-        )
-
-
 class CartPoleAgent:
+    state = None
+    q_values = None
+    next_q_values = None
+    action = None
+
     def __init__(self, epsilon: float = 0.1, gamma: float = 0.9):
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.prediction_net = AgentNet(self.device).to(self.device)
-        self.target_net = AgentNet(self.device).to(self.device)
+        self.device = (
+            torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+        )
+        self.policy_net = self.create_neural_net().to(self.device)
+        self.target_net = self.create_neural_net().eval().to(self.device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
         self.epsilon = epsilon
         self.gamma = gamma
 
-    def calculate_prediction_q_value(self, screen: np.ndarray, action: int):
-        tensor = self._convert_to_tensor(screen)
-        action = torch.FloatTensor([action]).unsqueeze(0)
-        return self.prediction_net(tensor, action)
+    def create_neural_net(self) -> nn.Module:
+        return nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=5, stride=2),
+            nn.BatchNorm2d(16),
+            nn.LeakyReLU(),
+            nn.Conv2d(16, 32, kernel_size=5, stride=2),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(),
+            nn.Conv2d(32, 32, kernel_size=5, stride=2),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(),
+            nn.Flatten(),
+            nn.Linear(108288, 128),
+            nn.LeakyReLU(),
+            nn.Linear(128, 2),
+        )
 
-    def calculate_target_q_value(self, screen: np.ndarray, action: int):
-        tensor = self._convert_to_tensor(screen)
-        action = torch.FloatTensor([action]).unsqueeze(0)
-        return self.prediction_net(tensor, action)
+    def get_policy_result(self, state: np.ndarray) -> torch.Tensor:
+        tensor = torch.from_numpy(state.astype(np.float64))
+        tensor /= 255.0
+        tensor = tensor.transpose(2, 1).transpose(0, 1).unsqueeze(dim=0).float()
+        return self.policy_net(tensor.to(self.device))
 
-    def get_max_value_action(self, screen: np.ndarray) -> torch.Tensor:
-        q_values = []
-        for action in range(2):
-            q_values.append(self.calculate_target_q_value(screen, action))
-        _, max_value = max(enumerate(q_values), key=operator.itemgetter(1))
+    def get_target_result(self, state: np.ndarray) -> torch.Tensor:
+        tensor = torch.from_numpy(state.astype(np.float64))
+        tensor /= 255.0
+        tensor = tensor.transpose(2, 1).transpose(0, 1).unsqueeze(dim=0).float()
+        return self.target_net(tensor.to(self.device))
+
+    def get_best_value_from_target(self, state: np.ndarray) -> torch.Tensor:
+        q_values = self.get_target_result(state)
+        max_value = torch.max(q_values)
         return max_value
 
-    def get_action_max_value(self, screen: np.ndarray) -> int:
-        q_values = []
-        for action in range(2):
-            q_values.append(self.calculate_prediction_q_value(screen, action))
-        action, _ = max(enumerate(q_values), key=operator.itemgetter(1))
-        return action
+    def get_best_action(self, state: np.ndarray) -> torch.Tensor:
+        q_values = self.get_policy_result(state)
+        best_action = torch.argmax(q_values, dim=-1)
+        return best_action
 
-    def epsilon_greedy(self, screen: np.ndarray, step_number: int = 1) -> int:
+    def epsilon_greedy(self, state: np.ndarray, step_number: int = 1) -> int:
         if random.random() < self.epsilon / step_number:
             return round(random.random())
         else:
-            action = self.get_action_max_value(screen)
+            with torch.no_grad():
+                action = self.get_best_action(state).item()
             return action
 
     def save_weights(self):
-        torch.save(self.prediction_net.state_dict(), "../weights/cart_pole_cnn.pth")
-
-    def _convert_to_tensor(self, screen: np.ndarray):
-        return (
-            torch.from_numpy(screen.astype(np.float64))
-            .transpose(1, 2)
-            .transpose(0, 1)
-            .float()
-            .unsqueeze(dim=0)
-        )
+        torch.save(self.policy_net.state_dict(), "../weights/cart_pole_ann.pth")
 
     @contextmanager
     def enable_train_mode(self):
         try:
-            self.prediction_net = self.prediction_net.train(True)
+            self.policy_net = self.policy_net.train(True)
             yield
         finally:
-            self.prediction_net = self.prediction_net.train(False)
+            self.policy_net = self.policy_net.train(False)
 
 
-def train(env: gym.Env, agent: CartPoleAgent, num_episodes=20000):
-    optimizer = optim.Adam(
-        agent.prediction_net.parameters(), lr=0.001, weight_decay=0.001
-    )
-    criterion = nn.MSELoss()
-    optimizer.zero_grad()
-    with agent.enable_train_mode():
-        rewards = [0]
-        iters = [0]
-        losses = [0]
-        for iter_num in tqdm.tqdm(
-            range(1, num_episodes + 1), desc="Train Loss: {}".format(losses[-1])
-        ):
-            if iter_num % 10 == 0:
-                optimizer.step()
-                optimizer.zero_grad()
-                agent.target_net.load_state_dict(agent.prediction_net.state_dict())
-            done = False
-            print(env.reset())
-            screen = env.render(mode="rgb_array")
-            total_reward = 0
-            while not done:
-                # environment interaction
-                action = agent.epsilon_greedy(screen)
-                old_screen = screen.copy()
-                _, reward, done, _ = env.step(action)
-                screen = env.render(mode="rgb_array")
-                with torch.no_grad():
-                    best_next_value = agent.get_max_value_action(screen)
+def train(env: gym.Env, agent: CartPoleAgent, num_episodes=10000):
+    optimizer = optim.Adam(agent.policy_net.parameters(), lr=0.001)
+    criterion = nn.SmoothL1Loss()
 
-                # if type(env.steps_beyond_done) == int:
-                #     done = env.steps_beyond_done > 100
+    try:
+        with agent.enable_train_mode():
+            losses = [0]
+            avg_loss = 0.0
+            avg_iter = 0
+            bar = tqdm.tqdm(range(1, num_episodes + 1))
+            for iter_num in bar:
+                if iter_num % 10 == 0:
+                    agent.target_net.load_state_dict(agent.policy_net.state_dict())
+                done = False
+                _ = env.reset()
+                state = env.render(mode="rgb_array")
+                tensor = state.copy()
+                total_reward = 0
+                while not done:
+                    old_state = state.copy()
+                    action = agent.epsilon_greedy(tensor)
+                    _, reward, done, _ = env.step(action)
+                    state = env.render(mode="rgb_array")
+                    tensor = state - old_state
+                    best_next_value = agent.get_best_value_from_target(state).item()
 
-                # creating the target
-                if done:
-                    y_target = reward
-                else:
-                    y_target = reward + agent.gamma * best_next_value
+                    if done:
+                        y_target = -1
+                    else:
+                        y_target = reward + agent.gamma * best_next_value
 
-                y_target = torch.FloatTensor([y_target]).to(agent.device)
-                prediction = agent.calculate_prediction_q_value(old_screen, action)
-                total_reward += reward
-                loss = criterion(prediction, y_target)
-                print(
-                    "Target -> {:2.10} \tPrediction -> {:2.10} \tLoss -> {:2.10}".format(
-                        y_target.item(), prediction.item(), loss.item()
-                    )
-                )
-                loss.backward()
-
-            iters.append(iter_num)
-            rewards.append(total_reward)
-            losses.append(loss.detach().item())
-    plt.plot(iters, losses)
-    plt.show()
-
-    plt.clf()
-    plt.plot(iters, rewards)
-    plt.show()
-    env.close()
+                    y_target = torch.FloatTensor([y_target]).to(agent.device)
+                    prediction = torch.max(agent.get_policy_result(old_state))
+                    total_reward += reward
+                    loss = criterion(prediction, y_target)
+                    loss.backward()
+                    avg_loss += loss.item()
+                    avg_iter += 1
+                    losses.append(loss.detach().item())
+                    optimizer.step()
+                    optimizer.zero_grad()
+                bar.set_description("Loss -> {:2.10f}".format(avg_loss / avg_iter))
+        plt.plot(losses)
+        plt.show()
+        env.close()
+    except KeyboardInterrupt:
+        optimizer.zero_grad()
+        plt.plot(losses)
+        plt.show()
+        env.close()
 
 
 def demonstrate(env: gym.Env, agent: CartPoleAgent):
@@ -212,12 +179,13 @@ def demonstrate(env: gym.Env, agent: CartPoleAgent):
         while True:
             done = False
             np.random.seed(random.randint(0, 10000))
-            state = env.reset()
+            _ = env.reset()
+            state = env.render("rgb_array")
             while not done:
                 env.render()
-                screen = env.render("rgb_array")
-                action = agent.get_action_max_value(screen)
-                state, reward, _, info = env.step(action)
+                action = torch.argmax(agent.get_policy_result(state)).item()
+                _, reward, _, info = env.step(action)
+                state = env.render("rgb_array")
                 if type(env.steps_beyond_done) == int:
                     done = env.steps_beyond_done > 100
                 time.sleep(1 / 60)
@@ -228,13 +196,13 @@ def demonstrate(env: gym.Env, agent: CartPoleAgent):
 def main():
     environment = gym.make("CartPole-v0")
     agent = CartPoleAgent()
-    np.random.random()
     demonstrate(environment, agent)
     train(environment, agent)
     agent.save_weights()
-    # agent.prediction_net.load_state_dict(torch.load("../weights/cart_pole_ann.pth"))
+    # agent.policy_net.load_state_dict(torch.load("../weights/cart_pole_ann.pth"))
     # agent.target_net.load_state_dict(torch.load("../weights/cart_pole_ann.pth"))
     demonstrate(environment, agent)
+    breakpoint()
 
 
 if __name__ == "__main__":
