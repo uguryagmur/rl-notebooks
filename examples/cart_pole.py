@@ -134,6 +134,7 @@ def train(env: gym.Env, agent: CartPoleAgent, num_episodes=100000):
                 total_reward = 0
                 targets = []
                 states = []
+                best_reward = 0
                 while not done:
                     old_state = state.copy()
                     action = agent.epsilon_greedy(old_state)
@@ -165,6 +166,9 @@ def train(env: gym.Env, agent: CartPoleAgent, num_episodes=100000):
                         loss.item(), total_reward / 200
                     )
                 )
+                if total_reward > best_reward:
+                    agent.save_weights()
+                    best_reward = total_reward
         plt.plot(losses)
         plt.show()
     except KeyboardInterrupt:
@@ -195,8 +199,6 @@ def main():
     environment = gym.make("CartPole-v0")
     agent = CartPoleAgent()
     train(environment, agent)
-    agent.save_weights()
-    # agent.target_net.load_state_dict(torch.load("../weights/cart_pole_ann.pth"))
     demonstrate(environment, agent)
 
 
