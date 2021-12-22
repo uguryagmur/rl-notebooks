@@ -7,10 +7,10 @@ import random
 import numpy as np
 import torch.nn as nn
 import torch.optim as optim
-import torch.functional as func
 import matplotlib.pyplot as plt
 
 from contextlib import contextmanager
+from torch.utils.tensorboard import SummaryWriter
 
 """
 Cart Pole System Notes
@@ -51,6 +51,7 @@ class CartPoleAgent:
     q_values = None
     next_q_values = None
     action = None
+    writer = SummaryWriter()
 
     def __init__(self, epsilon: float = 0.1, gamma: float = 0.9):
         self.policy_net = self.create_neural_net()
@@ -117,15 +118,13 @@ class CartPoleAgent:
             self.policy_net = self.policy_net.train(False)
 
 
-def train(env: gym.Env, agent: CartPoleAgent, num_episodes=12000):
+def train(env: gym.Env, agent: CartPoleAgent, num_episodes=100000):
     optimizer = optim.Adam(agent.policy_net.parameters(), lr=0.001)
     criterion = nn.SmoothL1Loss()
 
     try:
         with agent.enable_train_mode():
             losses = [0]
-            avg_loss = 0.0
-            avg_iter = 0
             bar = tqdm.tqdm(range(1, num_episodes + 1))
             for iter_num in bar:
                 if iter_num % 10 == 0:
@@ -133,6 +132,8 @@ def train(env: gym.Env, agent: CartPoleAgent, num_episodes=12000):
                 done = False
                 state = env.reset()
                 total_reward = 0
+                targets = []
+                states = []
                 while not done:
                     old_state = state.copy()
                     action = agent.epsilon_greedy(old_state)
@@ -145,25 +146,30 @@ def train(env: gym.Env, agent: CartPoleAgent, num_episodes=12000):
                         y_target = reward + agent.gamma * best_next_value
 
                     y_target = torch.FloatTensor([y_target])
-                    prediction = torch.max(agent.get_policy_result(old_state))
-                    total_reward += reward
-                    loss = criterion(prediction, y_target)
                     env.render()
-                    loss.backward()
-                    avg_loss += loss.item()
-                    avg_iter += 1
-                    losses.append(loss.detach().item())
-                    optimizer.step()
-                    optimizer.zero_grad()
-                bar.set_description("Loss -> {:2.10f}".format(avg_loss / avg_iter))
+                    total_reward += reward
+                    targets.append(y_target)
+                    states.append(old_state)
+                targets = torch.stack(targets, dim=0)
+                states = np.stack(states, axis=0)
+                prediction, _ = torch.max(agent.get_policy_result(states), dim=-1)
+                loss = criterion(prediction.unsqueeze(dim=1), targets)
+                loss.backward()
+                losses.append(loss.detach().item())
+                optimizer.step()
+                optimizer.zero_grad()
+                agent.writer.add_scalar("loss", loss.item(), iter_num)
+                agent.writer.add_scalar("total_reward", total_reward / 200, iter_num)
+                bar.set_description(
+                    "Loss -> {:1.6f} Reward -> {:1.3f}".format(
+                        loss.item(), total_reward / 200
+                    )
+                )
         plt.plot(losses)
         plt.show()
-        env.close()
     except KeyboardInterrupt:
-        optimizer.zero_grad()
         plt.plot(losses)
         plt.show()
-        env.close()
 
 
 def demonstrate(env: gym.Env, agent: CartPoleAgent):
@@ -176,8 +182,9 @@ def demonstrate(env: gym.Env, agent: CartPoleAgent):
             while not done:
                 env.render()
                 action = torch.argmax(agent.get_policy_result(state)).item()
-                state, reward, _, info = env.step(action)
+                state, reward, _done, info = env.step(action)
                 if type(env.steps_beyond_done) == int:
+                    print(reward)
                     done = env.steps_beyond_done > 100
                 time.sleep(1 / 60)
     except KeyboardInterrupt:
@@ -187,10 +194,8 @@ def demonstrate(env: gym.Env, agent: CartPoleAgent):
 def main():
     environment = gym.make("CartPole-v0")
     agent = CartPoleAgent()
-    # demonstrate(environment, agent)
     train(environment, agent)
     agent.save_weights()
-    # agent.policy_net.load_state_dict(torch.load("../weights/cart_pole_ann_rbf.pth"))
     # agent.target_net.load_state_dict(torch.load("../weights/cart_pole_ann.pth"))
     demonstrate(environment, agent)
 
