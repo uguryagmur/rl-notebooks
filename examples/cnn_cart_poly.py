@@ -11,6 +11,7 @@ import torch.optim as optim
 import torch.functional as func
 import matplotlib.pyplot as plt
 
+from typing import List, Any
 from contextlib import contextmanager
 
 """
@@ -47,6 +48,30 @@ Episode Termination:
 """
 
 
+class ReplayMemory:
+    def __init__(self, size: int = 100):
+        self.size = size
+        self.memory = []
+
+    def append(self, element: Any):
+        self.memory.insert(0, element)
+        if len(self.memory) > self.size:
+            self.memory.pop()
+
+    def sample(self, batch_size: int = 16):
+        return random.sample(self.memory, batch_size)
+
+    def is_full(self) -> bool:
+        return self.size == len(self.memory)
+
+    def gather(self, sample: List[Any]):
+        target, states = [], []
+        for elem in sample:
+            target.append(elem[0])
+            states.append(elem[1])
+        return target, states
+
+
 class CartPoleAgent:
     state = None
     q_values = None
@@ -80,16 +105,18 @@ class CartPoleAgent:
             nn.Linear(128, 2),
         )
 
-    def get_policy_result(self, state: np.ndarray) -> torch.Tensor:
+    @staticmethod
+    def normalize(state: np.ndarray):
         tensor = torch.from_numpy(state.astype(np.float64))
-        tensor /= 255.0
-        tensor = tensor.transpose(2, 1).transpose(0, 1).unsqueeze(dim=0).float()
+        tensor = tensor.transpose(3, 2).transpose(1, 2).float()
+        return tensor / 255.0
+
+    def get_policy_result(self, state: np.ndarray) -> torch.Tensor:
+        tensor = self.normalize(state)
         return self.policy_net(tensor.to(self.device))
 
     def get_target_result(self, state: np.ndarray) -> torch.Tensor:
-        tensor = torch.from_numpy(state.astype(np.float64))
-        tensor /= 255.0
-        tensor = tensor.transpose(2, 1).transpose(0, 1).unsqueeze(dim=0).float()
+        tensor = self.normalize(state)
         return self.target_net(tensor.to(self.device))
 
     def get_best_value_from_target(self, state: np.ndarray) -> torch.Tensor:
@@ -129,24 +156,23 @@ def train(env: gym.Env, agent: CartPoleAgent, num_episodes=10000):
     try:
         with agent.enable_train_mode():
             losses = [0]
-            avg_loss = 0.0
-            avg_iter = 0
             bar = tqdm.tqdm(range(1, num_episodes + 1))
+            memory = ReplayMemory()
             for iter_num in bar:
                 if iter_num % 10 == 0:
                     agent.target_net.load_state_dict(agent.policy_net.state_dict())
                 done = False
                 _ = env.reset()
                 state = env.render(mode="rgb_array")
-                tensor = state.copy()
                 total_reward = 0
                 while not done:
                     old_state = state.copy()
-                    action = agent.epsilon_greedy(tensor)
+                    action = agent.epsilon_greedy(np.expand_dims(old_state, 0))
                     _, reward, done, _ = env.step(action)
                     state = env.render(mode="rgb_array")
-                    tensor = state - old_state
-                    best_next_value = agent.get_best_value_from_target(state).item()
+                    best_next_value = agent.get_best_value_from_target(
+                        np.expand_dims(state, 0)
+                    ).item()
 
                     if done:
                         y_target = -1
@@ -154,16 +180,24 @@ def train(env: gym.Env, agent: CartPoleAgent, num_episodes=10000):
                         y_target = reward + agent.gamma * best_next_value
 
                     y_target = torch.FloatTensor([y_target]).to(agent.device)
-                    prediction = torch.max(agent.get_policy_result(old_state))
+                    # prediction = torch.max(agent.get_policy_result(old_state))
                     total_reward += reward
-                    loss = criterion(prediction, y_target)
+                    memory.append((y_target, old_state))
+                if memory.is_full():
+                    targets, states = memory.gather(memory.sample())
+                    states = np.stack(states, 0)
+                    targets = torch.concat(targets, dim=0)
+                    prediction, _ = torch.max(agent.get_policy_result(states), dim=-1)
+                    loss = criterion(prediction, targets)
                     loss.backward()
-                    avg_loss += loss.item()
-                    avg_iter += 1
                     losses.append(loss.detach().item())
                     optimizer.step()
                     optimizer.zero_grad()
-                bar.set_description("Loss -> {:2.10f}".format(avg_loss / avg_iter))
+                    bar.set_description(
+                        "Loss -> {:1.6f} Reward -> {:1.4f}".format(
+                            loss.item(), total_reward / 200
+                        )
+                    )
         plt.plot(losses)
         plt.show()
         env.close()
@@ -183,7 +217,7 @@ def demonstrate(env: gym.Env, agent: CartPoleAgent):
             state = env.render("rgb_array")
             while not done:
                 env.render()
-                action = torch.argmax(agent.get_policy_result(state)).item()
+                action = torch.argmax(agent.get_policy_result(np.expand_dims(state, 0))).item()
                 _, reward, _, info = env.step(action)
                 state = env.render("rgb_array")
                 if type(env.steps_beyond_done) == int:
@@ -196,7 +230,6 @@ def demonstrate(env: gym.Env, agent: CartPoleAgent):
 def main():
     environment = gym.make("CartPole-v0")
     agent = CartPoleAgent()
-    demonstrate(environment, agent)
     train(environment, agent)
     agent.save_weights()
     # agent.policy_net.load_state_dict(torch.load("../weights/cart_pole_ann.pth"))
