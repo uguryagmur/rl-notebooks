@@ -170,3 +170,6 @@ cython_debug/
 
 # Tensorboard logs
 *runs/
+
+# Weights
+weights/*
