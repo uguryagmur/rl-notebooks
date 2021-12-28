@@ -1,4 +1,5 @@
 import gym
+from torch.nn.modules.activation import LeakyReLU
 import tqdm
 import time
 import torch
@@ -8,8 +9,10 @@ import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
 
-from typing import Any
+from typing import List, Any
+from collections import deque
 from contextlib import contextmanager
+from torchvision.transforms import ToTensor
 from torch.utils.tensorboard import SummaryWriter
 
 """
@@ -48,22 +51,27 @@ Episode Termination:
 
 class ReplayMemory:
     def __init__(self, size: int = 100):
-        self.size = 0
-        self.memory = torch.zeros((size, 5))
+        self.memory = deque(maxlen=size)
 
-    def append(self, element: Any):
-        if self.size < self.memory.size(0):
-            self.size += 1
-        stacked = torch.concat(element, dim=0)
-        self.memory = torch.concat((stacked.unsqueeze(0), self.memory[:-1]), dim=0)
+    def append(self, state, action, reward, next_state, done):
+        experience = (state, action, reward, next_state, done)
+        self.memory.append(experience)
 
-    def sample(self, batch_size: int = 16):
-        perm = torch.randperm(self.memory.size(0))
-        sample = self.memory[perm[:batch_size]]
-        return sample[..., 0], sample[..., 1:]
+    def sample(self, batch_size: int = 32):
+        return self.gather(random.sample(self.memory, batch_size))
 
     def is_full(self) -> bool:
-        return self.size == self.memory.size(0)
+        return self.memory.maxlen == len(self.memory)
+
+    def gather(self, sample: List[Any]):
+        state, action, reward, n_state, done = [], [], [], [], []
+        for elem in sample:
+            state.append(elem[0])
+            action.append(elem[1])
+            reward.append(elem[2])
+            n_state.append(elem[3])
+            done.append(elem[4])
+        return state, action, reward, n_state, done
 
 
 class CartPoleAgent:
@@ -72,25 +80,28 @@ class CartPoleAgent:
     next_q_values = None
     action = None
     writer = SummaryWriter()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    to_tensor = ToTensor()
 
     def __init__(self, epsilon: float = 0.1, gamma: float = 0.9):
-        self.policy_net = self.create_neural_net()
-        self.target_net = self.create_neural_net().eval()
-        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.policy_net = self.create_neural_net().to(self.device)
         self.epsilon = epsilon
         self.gamma = gamma
 
     def create_neural_net(self) -> nn.Module:
         return nn.Sequential(
-            nn.Linear(4, 256),
+            nn.Linear(4, 128),
             nn.LeakyReLU(),
-            nn.Linear(256, 128),
+            nn.Linear(128, 256),
             nn.LeakyReLU(),
-            nn.Linear(128, 2),
+            nn.Linear(256, 2),
         )
 
-    def normalize_state(self, state):
-        tensor = torch.from_numpy(state)
+    def normalize(self, state):
+        if type(state) != torch.Tensor:
+            tensor = torch.from_numpy(state)
+        else:
+            tensor = state.clone()
         tensor[..., 0] /= 4.8
         tensor[..., 1] = torch.tanh(tensor[..., 1])
         tensor[..., 2] /= 0.418
@@ -98,17 +109,8 @@ class CartPoleAgent:
         return tensor
 
     def get_policy_result(self, state: np.ndarray) -> torch.Tensor:
-        tensor = self.normalize_state(state)
-        return self.policy_net(tensor)
-
-    def get_target_result(self, state: np.ndarray) -> torch.Tensor:
-        tensor = self.normalize_state(state)
-        return self.target_net(tensor)
-
-    def get_best_value_from_target(self, state: np.ndarray) -> torch.Tensor:
-        q_values = self.get_target_result(state)
-        max_value = torch.max(q_values)
-        return max_value
+        tensor = self.normalize(state)
+        return self.policy_net(tensor.to(self.device))
 
     def get_best_action(self, state: np.ndarray) -> torch.Tensor:
         q_values = self.get_policy_result(state)
@@ -123,15 +125,8 @@ class CartPoleAgent:
                 action = self.get_best_action(state).item()
             return action
 
-    def save_weights(self):
-        torch.save(self.policy_net.state_dict(), "../weights/cart_pole_ann.pth")
-
-    def _normalize(self, state: np.ndarray):
-        state[0] = (state[0] + 4.8) / 9.6
-        state[1] /= np.finfo(np.float64).max
-        state[2] = (state[0] + 0.418) / 0.836
-        state[3] /= np.finfo(np.float64).max
-        return state
+    def save_weights(self, path: str):
+        torch.save(self.policy_net.state_dict(), path)
 
     @contextmanager
     def enable_train_mode(self):
@@ -142,58 +137,79 @@ class CartPoleAgent:
             self.policy_net = self.policy_net.train(False)
 
 
-def train(env: gym.Env, agent: CartPoleAgent, num_episodes=100000):
-    optimizer = optim.RMSprop(agent.policy_net.parameters(), lr=0.005)
-    criterion = nn.SmoothL1Loss()
+def train(
+    env: gym.Env, policy_agent: CartPoleAgent, num_episodes=10000,
+):
+    optimizer = optim.Adam(
+        policy_agent.policy_net.parameters(), lr=0.001, weight_decay=0.01
+    )
+    criterion = nn.MSELoss(reduction="none")
 
     try:
-        with agent.enable_train_mode():
+        with policy_agent.enable_train_mode():
             losses = [0]
             bar = tqdm.tqdm(range(1, num_episodes + 1))
             memory = ReplayMemory(300)
             for iter_num in bar:
-                if iter_num % 10 == 0:
-                    agent.target_net.load_state_dict(agent.policy_net.state_dict())
                 done = False
                 state = env.reset()
+                env.render()
                 total_reward = 0
                 best_reward = 0
                 while not done:
+                    action = policy_agent.epsilon_greedy(state)
                     old_state = state.copy()
-                    action = agent.epsilon_greedy(old_state)
                     state, reward, done, _ = env.step(action)
-                    best_next_value = agent.get_best_value_from_target(state).item()
-
                     if done:
-                        y_target = -1
-                    else:
-                        y_target = reward + agent.gamma * best_next_value
-
-                    y_target = torch.FloatTensor([y_target])
-                    env.render()
+                        reward = -1
+                    elif np.abs(state[0]) > 2:
+                        reward = 0
                     total_reward += reward
-                    memory.append([y_target, torch.from_numpy(old_state)])
-                if memory.is_full():
-                    targets, states = memory.sample()
-                    prediction, _ = torch.max(
-                        agent.get_policy_result(states.numpy()), dim=-1
+                    memory.append(
+                        torch.from_numpy(old_state),
+                        action,
+                        reward,
+                        torch.from_numpy(state),
+                        int(done),
                     )
-                    loss = criterion(prediction, targets)
-                    loss.backward()
-                    losses.append(loss.detach().item())
+
+                if memory.is_full():
+                    states, actions, rewards, n_states, dones = memory.sample(10)
+                    states = torch.stack(states, 0)
+                    actions = torch.FloatTensor(actions).unsqueeze(dim=1).long()
+                    rewards = torch.FloatTensor(rewards)
+                    n_states = torch.stack(n_states, 0)
+                    dones = torch.FloatTensor(dones)
+
+                    with torch.no_grad():
+                        max_next_q, _ = torch.max(
+                            policy_agent.get_policy_result(n_states.float()), dim=-1
+                        )
+
+                    targets = (
+                        (rewards + (1 - dones) * policy_agent.gamma * max_next_q.cpu())
+                        .unsqueeze(dim=1)
+                    )
+                    prediction = policy_agent.get_policy_result(states.float()).gather(
+                        1, actions.cuda()
+                    )
+
+                    loss = criterion(prediction, targets.cuda())
+                    loss.backward(loss)
+                    losses.append(loss.mean().detach().item())
                     optimizer.step()
                     optimizer.zero_grad()
-                    agent.writer.add_scalar("loss", loss.item(), iter_num)
-                    agent.writer.add_scalar(
+                    policy_agent.writer.add_scalar("loss", loss.mean().item(), iter_num)
+                    policy_agent.writer.add_scalar(
                         "total_reward", total_reward / 200, iter_num
                     )
                     bar.set_description(
                         "Loss -> {:1.6f} Reward -> {:1.3f}".format(
-                            loss.item(), total_reward / 200
+                            loss.mean().item(), total_reward / 200
                         )
                     )
                     if total_reward >= best_reward:
-                        agent.save_weights()
+                        policy_agent.save_weights("../weights/cart_pole_ann.pth")
                         best_reward = total_reward
         plt.plot(losses)
         plt.show()
@@ -208,13 +224,12 @@ def demonstrate(env: gym.Env, agent: CartPoleAgent):
             done = False
             np.random.seed(random.randint(0, 10000))
             state = env.reset()
-            print(state)
+            env.render()
             while not done:
-                env.render()
                 action = torch.argmax(agent.get_policy_result(state)).item()
                 state, reward, _done, info = env.step(action)
+                env.render()
                 if type(env.steps_beyond_done) == int:
-                    print(reward)
                     done = env.steps_beyond_done > 100
                 time.sleep(1 / 60)
     except KeyboardInterrupt:
@@ -223,11 +238,9 @@ def demonstrate(env: gym.Env, agent: CartPoleAgent):
 
 def main():
     environment = gym.make("CartPole-v0")
-    agent = CartPoleAgent()
-    # agent.policy_net.load_state_dict(torch.load("../weights/ann_cart_pole_final.pth"))
-    train(environment, agent)
-    torch.save(agent.policy_net.state_dict(), "../weights/ann_cart_pole_final.pth")
-    demonstrate(environment, agent)
+    policy_agent = CartPoleAgent()
+    train(environment, policy_agent)
+    demonstrate(environment, policy_agent)
 
 
 if __name__ == "__main__":
