@@ -1,5 +1,5 @@
-from os import environ, stat
 import gym
+from torch.nn.modules.activation import LeakyReLU
 import tqdm
 import time
 import torch
@@ -7,13 +7,17 @@ import random
 import numpy as np
 import torch.nn as nn
 import torch.optim as optim
-import torch.functional as func
 import matplotlib.pyplot as plt
 
+from typing import List, Any
+from collections import deque
 from contextlib import contextmanager
+from torchvision.transforms import ToTensor
+from torch.utils.tensorboard import SummaryWriter
+
 
 """
-Cart Pole System Notes
+Mountain Car System Notes
 
 Environment observation:
     Type: Box(4)
@@ -45,16 +49,42 @@ Episode Termination:
 """
 
 
+class ReplayMemory:
+    def __init__(self, size: int = 100):
+        self.memory = deque(maxlen=size)
+
+    def append(self, state, action, reward, next_state, done):
+        experience = (state, action, reward, next_state, done)
+        self.memory.append(experience)
+
+    def sample(self, batch_size: int = 32):
+        return self.gather(random.sample(self.memory, batch_size))
+
+    def is_full(self) -> bool:
+        return self.memory.maxlen == len(self.memory)
+
+    def gather(self, sample: List[Any]):
+        state, action, reward, n_state, done = [], [], [], [], []
+        for elem in sample:
+            state.append(elem[0])
+            action.append(elem[1])
+            reward.append(elem[2])
+            n_state.append(elem[3])
+            done.append(elem[4])
+        return state, action, reward, n_state, done
+
+
 class MountainCarAgent:
     state = None
     q_values = None
     next_q_values = None
     action = None
+    writer = SummaryWriter()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    to_tensor = ToTensor()
 
     def __init__(self, epsilon: float = 0.1, gamma: float = 0.9):
-        self.policy_net = self.create_neural_net()
-        self.target_net = self.create_neural_net().eval()
-        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.policy_net = self.create_neural_net().to(self.device)
         self.epsilon = epsilon
         self.gamma = gamma
 
@@ -62,27 +92,23 @@ class MountainCarAgent:
         return nn.Sequential(
             nn.Linear(2, 128),
             nn.LeakyReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(128, 256),
             nn.LeakyReLU(),
-            nn.Linear(128, 3),
+            nn.Linear(256, 3),
         )
 
+    def normalize(self, state):
+        if type(state) != torch.Tensor:
+            tensor = torch.from_numpy(state)
+        else:
+            tensor = state.clone()
+        tensor[..., 0] /= 1.8
+        tensor[..., 1] /= 0.14
+        return tensor
+
     def get_policy_result(self, state: np.ndarray) -> torch.Tensor:
-        tensor = torch.from_numpy(state)
-        tensor[..., 0] = (tensor[..., 0] + 1.2) / 1.8
-        tensor[..., 0] = (tensor[..., 0] + 0.07) / 0.14
-        return self.policy_net(tensor)
-
-    def get_target_result(self, state: np.ndarray) -> torch.Tensor:
-        tensor = torch.from_numpy(state)
-        tensor[..., 0] = (tensor[..., 0] + 1.2) / 1.8
-        tensor[..., 0] = (tensor[..., 0] + 0.07) / 0.14
-        return self.target_net(tensor)
-
-    def get_best_value_from_target(self, state: np.ndarray) -> torch.Tensor:
-        q_values = self.get_target_result(state)
-        max_value = torch.max(q_values)
-        return max_value
+        tensor = self.normalize(state)
+        return self.policy_net(tensor.to(self.device))
 
     def get_best_action(self, state: np.ndarray) -> torch.Tensor:
         q_values = self.get_policy_result(state)
@@ -97,8 +123,8 @@ class MountainCarAgent:
                 action = self.get_best_action(state).item()
             return action
 
-    def save_weights(self):
-        torch.save(self.policy_net.state_dict(), "../weights/cart_pole_ann.pth")
+    def save_weights(self, path: str):
+        torch.save(self.policy_net.state_dict(), path)
 
     @contextmanager
     def enable_train_mode(self):
@@ -109,53 +135,82 @@ class MountainCarAgent:
             self.policy_net = self.policy_net.train(False)
 
 
-def train(env: gym.Env, agent: MountainCarAgent, num_episodes=8000):
-    optimizer = optim.Adam(agent.policy_net.parameters(), lr=0.001)
-    criterion = nn.SmoothL1Loss()
+def train(
+    env: gym.Env, policy_agent: MountainCarAgent, num_episodes=10000,
+):
+    optimizer = optim.Adam(
+        policy_agent.policy_net.parameters(), lr=0.001, weight_decay=0.01
+    )
+    criterion = nn.MSELoss(reduction="none")
 
     try:
-        with agent.enable_train_mode():
+        with policy_agent.enable_train_mode():
             losses = [0]
             bar = tqdm.tqdm(range(1, num_episodes + 1))
+            memory = ReplayMemory(300)
             for iter_num in bar:
-                if iter_num % 10 == 0:
-                    agent.target_net.load_state_dict(agent.policy_net.state_dict())
                 done = False
                 state = env.reset()
+                env.render()
                 total_reward = 0
-                avg_loss = 0.0
-                avg_iter = 0
+                best_reward = 0
                 while not done:
+                    action = policy_agent.epsilon_greedy(state)
                     old_state = state.copy()
-                    action = agent.epsilon_greedy(old_state)
                     state, reward, done, _ = env.step(action)
-                    best_next_value = agent.get_best_value_from_target(state).item()
+                    reward = state[0]
 
-                    if done:
-                        y_target = state[0]
-                    else:
-                        y_target = state[0] + agent.gamma * best_next_value
-
-                    y_target = torch.FloatTensor([y_target])
-                    prediction = torch.max(agent.get_policy_result(old_state))
                     total_reward += reward
-                    loss = criterion(prediction, y_target)
-                    env.render()
-                    loss.backward()
-                    avg_loss += loss.item()
-                    avg_iter += 1
+                    memory.append(
+                        torch.from_numpy(old_state),
+                        action,
+                        reward,
+                        torch.from_numpy(state),
+                        int(done),
+                    )
+
+                if memory.is_full():
+                    states, actions, rewards, n_states, dones = memory.sample(10)
+                    states = torch.stack(states, 0)
+                    actions = torch.FloatTensor(actions).unsqueeze(dim=1).long()
+                    rewards = torch.FloatTensor(rewards)
+                    n_states = torch.stack(n_states, 0)
+                    dones = torch.FloatTensor(dones)
+
+                    with torch.no_grad():
+                        max_next_q, _ = torch.max(
+                            policy_agent.get_policy_result(n_states.float()), dim=-1
+                        )
+
+                    targets = (
+                        rewards + (1 - dones) * policy_agent.gamma * max_next_q.cpu()
+                    ).unsqueeze(dim=1)
+                    prediction = policy_agent.get_policy_result(states.float()).gather(
+                        1, actions.cuda()
+                    )
+
+                    loss = criterion(prediction, targets.cuda())
+                    loss.backward(loss)
+                    losses.append(loss.mean().detach().item())
                     optimizer.step()
                     optimizer.zero_grad()
-                bar.set_description("Loss -> {:2.10f}".format(avg_loss / avg_iter))
-                losses.append(avg_loss / avg_iter)
+                    policy_agent.writer.add_scalar("loss", loss.mean().item(), iter_num)
+                    policy_agent.writer.add_scalar(
+                        "total_reward", total_reward / 200, iter_num
+                    )
+                    bar.set_description(
+                        "Loss -> {:1.6f} Reward -> {:1.3f}".format(
+                            loss.mean().item(), total_reward / 200
+                        )
+                    )
+                    if total_reward >= best_reward:
+                        policy_agent.save_weights("../weights/cart_pole_ann.pth")
+                        best_reward = total_reward
         plt.plot(losses)
         plt.show()
-        env.close()
     except KeyboardInterrupt:
-        optimizer.zero_grad()
         plt.plot(losses)
         plt.show()
-        env.close()
 
 
 def demonstrate(env: gym.Env, agent: MountainCarAgent):
@@ -164,11 +219,11 @@ def demonstrate(env: gym.Env, agent: MountainCarAgent):
             done = False
             np.random.seed(random.randint(0, 10000))
             state = env.reset()
-            print(state)
+            env.render()
             while not done:
-                env.render()
                 action = torch.argmax(agent.get_policy_result(state)).item()
-                state, reward, _, info = env.step(action)
+                state, reward, _done, info = env.step(action)
+                env.render()
                 time.sleep(1 / 60)
     except KeyboardInterrupt:
         env.close()
@@ -176,13 +231,9 @@ def demonstrate(env: gym.Env, agent: MountainCarAgent):
 
 def main():
     environment = gym.make("MountainCar-v0")
-    agent = MountainCarAgent()
-    # demonstrate(environment, agent)
-    train(environment, agent)
-    agent.save_weights()
-    # agent.policy_net.load_state_dict(torch.load("../weights/cart_pole_ann_rbf.pth"))
-    # agent.target_net.load_state_dict(torch.load("../weights/cart_pole_ann.pth"))
-    demonstrate(environment, agent)
+    policy_agent = MountainCarAgent()
+    train(environment, policy_agent)
+    demonstrate(environment, policy_agent)
 
 
 if __name__ == "__main__":
