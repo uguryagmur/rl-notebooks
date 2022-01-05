@@ -50,7 +50,9 @@ class Generator(nn.Module):
         )
 
     def forward(self, tensor: torch.Tensor) -> torch.Tensor:
-        return self.net(tensor.to(self.device) / 255.0) * 255.0
+        output = self.net(tensor.to(self.device))
+        output = torch.clamp(output, min=0, max=255)
+        return output
 
     def initialize_weights(self):
         for weight in self.parameters():
@@ -107,7 +109,7 @@ class Generator(nn.Module):
             nn.ConvTranspose2d(
                 self.feature_map_size, self.color_channel_size, 4, 2, 1, bias=False
             ),
-            nn.Tanh(),
+            nn.ReLU(),
             # output size (batch_size, color_channel_size, 128, 128)
         )
 
@@ -124,7 +126,7 @@ class Discriminator(nn.Module):
         self.to(self.device)
 
     def forward(self, tensor: torch.Tensor) -> torch.Tensor:
-        return self.net(tensor.to(self.device) / 255.0) * 255.0
+        return self.net(tensor.to(self.device) / 255.0)
 
     def initialize_weights(self):
         for weight in self.parameters():
@@ -192,8 +194,8 @@ class GANTrainer:
     lr = 0.0002
     beta1 = 0.5
     beta2 = 0.999
-    fake_label = 1
-    real_label = 0
+    fake_label = 0
+    real_label = 1
     writer = SummaryWriter("/home/adm1n/Shop/logs")
 
     def __init__(self):
@@ -218,6 +220,7 @@ class GANTrainer:
             total_gen_loss = 0.0
             batch_progress_bar = tqdm.tqdm(data_loader)
             for batch_iter, data in enumerate(batch_progress_bar):
+                data *= 255.0
                 target_real = [self.real_label] * data.size(0)
                 target_fake = [self.fake_label] * self.batch_size
                 target = target_real + target_fake
@@ -227,10 +230,6 @@ class GANTrainer:
                 generated: torch.Tensor = gen(noise)
                 disc_input = torch.cat((data.to(gen.device), generated))
                 rand_perm = torch.randperm(self.batch_size + data.size(0))
-                if max(rand_perm) > disc_input.size(0):
-                    breakpoint()
-                if max(rand_perm) > target.size(0):
-                    breakpoint()
                 disc_output = disc(disc_input[rand_perm].detach()).view(-1)
 
                 disc_loss: torch.Tensor = criterion(
@@ -299,27 +298,31 @@ class GANTrainer:
         plt.plot(loss_hist_g)
         plt.savefig("GAN_loss_graph.png")
 
+        # checkpoint for continuing to the training
+        torch.save(gen.state_dict(), "GAN_g.pth")
+        torch.save(disc.state_dict(), "GAN_d.pth")
+        torch.save(gen_optimizer.state_dict(), "GAN_g_opt.pth")
+        torch.save(disc_optimizer.state_dict(), "GAN_d_opt.pth")
+
 
 def demo_generator(gen: Generator):
     with torch.no_grad():
-        done = False
-        while not done:
+        while True:
             noise = torch.rand(size=(1, gen.latent_space_size, 1, 1))
-            fake: torch.Tensor = gen(noise).cpu().squeeze(dim=0)
+            fake: torch.Tensor = gen(noise).cpu().squeeze(dim=0).long()
             fake = fake.transpose(0, 1).transpose(1, 2).numpy()
             plt.imshow(fake)
             plt.show()
-            done = bool(input("Do you want to generate one more?\n\t"))
+            breakpoint()
 
 
 def main():
     generator = Generator()
     discriminator = Discriminator()
     trainer = GANTrainer()
-    trainer.train(generator, discriminator, 1)
+    trainer.train(generator, discriminator, 2)
     demo_generator(generator)
 
 
 if __name__ == "__main__":
-    # add tensorboard update
     main()
