@@ -84,7 +84,7 @@ class CartPoleAgent:
     to_tensor = ToTensor()
     resize = Resize(100)
 
-    def __init__(self, epsilon: float = 0.1, gamma: float = 0.9):
+    def __init__(self, epsilon: float = 0.8, gamma: float = 0.9):
         self.policy_net = self.create_neural_net().to(self.device)
         self.epsilon = epsilon
         self.gamma = gamma
@@ -172,7 +172,9 @@ def train(
                 total_reward = 0
                 best_reward = 0
                 while not done:
-                    action = policy_agent.epsilon_greedy(np.expand_dims(state, axis=0))
+                    action = policy_agent.epsilon_greedy(
+                        np.expand_dims(state, axis=0), iter_num / 4
+                    )
                     old_state = state.copy()
                     info, reward, done, _ = env.step(action)
                     state = env.render("rgb_array").astype(np.float64)
@@ -257,6 +259,8 @@ def main():
     environment = gym.make("CartPole-v0")
     policy_agent = CartPoleAgent()
     target_agent = CartPoleAgent()
+    policy_agent.policy_net.load_state_dict(torch.load("../weights/cart_pole_cnn.pth"))
+    target_agent.policy_net.load_state_dict(torch.load("../weights/cart_pole_cnn.pth"))
     train(environment, policy_agent, target_agent)
     demonstrate(environment, policy_agent)
 

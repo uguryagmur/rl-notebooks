@@ -83,7 +83,7 @@ class MountainCarAgent:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     to_tensor = ToTensor()
 
-    def __init__(self, epsilon: float = 0.1, gamma: float = 0.9):
+    def __init__(self, epsilon: float = 0.99, gamma: float = 0.9):
         self.policy_net = self.create_neural_net().to(self.device)
         self.epsilon = epsilon
         self.gamma = gamma
@@ -136,7 +136,7 @@ class MountainCarAgent:
 
 
 def train(
-    env: gym.Env, policy_agent: MountainCarAgent, num_episodes=10000,
+    env: gym.Env, policy_agent: MountainCarAgent, num_episodes=30000,
 ):
     optimizer = optim.Adam(
         policy_agent.policy_net.parameters(), lr=0.001, weight_decay=0.01
@@ -155,7 +155,7 @@ def train(
                 total_reward = 0
                 best_reward = 0
                 while not done:
-                    action = policy_agent.epsilon_greedy(state)
+                    action = policy_agent.epsilon_greedy(state, iter_num)
                     old_state = state.copy()
                     state, reward, done, _ = env.step(action)
                     reward = state[0]
@@ -194,7 +194,9 @@ def train(
                     losses.append(loss.mean().detach().item())
                     optimizer.step()
                     optimizer.zero_grad()
-                    policy_agent.writer.add_scalar("loss", loss.mean().item(), iter_num)
+                    policy_agent.writer.add_scalar(
+                        "loss", loss.mean().item(), iter_num / 10
+                    )
                     policy_agent.writer.add_scalar(
                         "total_reward", total_reward / 200, iter_num
                     )

@@ -1,4 +1,5 @@
 import glob
+from numpy import generic
 import tqdm
 import torch
 import torch.nn as nn
@@ -45,18 +46,16 @@ class Generator(nn.Module):
         self.net = self.configure_network()
         self.initialize_weights()
         self.to(self.device)
-        self.bok = nn.ConvTranspose2d(
-            self.latent_space_size, self.feature_map_size * 16, 4, 1, 0, bias=False
-        )
 
     def forward(self, tensor: torch.Tensor) -> torch.Tensor:
-        output = self.net(tensor.to(self.device))
-        output = torch.clamp(output, min=0, max=255)
-        return output
+        return self.net(tensor.to(self.device))
 
     def initialize_weights(self):
-        for weight in self.parameters():
-            nn.init.normal_(weight, 0, 0.02)
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.normal_(module.weight, 0, 0.02)
+            elif isinstance(module, nn.BatchNorm2d):
+                nn.init.normal_(module.weight, 1, 0.02)
 
     def configure_network(self):
         return nn.Sequential(
@@ -109,7 +108,7 @@ class Generator(nn.Module):
             nn.ConvTranspose2d(
                 self.feature_map_size, self.color_channel_size, 4, 2, 1, bias=False
             ),
-            nn.ReLU(),
+            nn.Tanh(),
             # output size (batch_size, color_channel_size, 128, 128)
         )
 
@@ -126,11 +125,14 @@ class Discriminator(nn.Module):
         self.to(self.device)
 
     def forward(self, tensor: torch.Tensor) -> torch.Tensor:
-        return self.net(tensor.to(self.device) / 255.0)
+        return self.net(tensor.to(self.device))
 
     def initialize_weights(self):
-        for weight in self.parameters():
-            nn.init.normal_(weight, 0, 0.02)
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.normal_(module.weight, 0, 0.02)
+            elif isinstance(module, nn.BatchNorm2d):
+                nn.init.normal_(module.weight, 1, 0.02)
 
     def configure_network(self):
         return nn.Sequential(
@@ -220,12 +222,12 @@ class GANTrainer:
             total_gen_loss = 0.0
             batch_progress_bar = tqdm.tqdm(data_loader)
             for batch_iter, data in enumerate(batch_progress_bar):
-                data *= 255.0
                 target_real = [self.real_label] * data.size(0)
                 target_fake = [self.fake_label] * self.batch_size
                 target = target_real + target_fake
                 target = torch.FloatTensor(target)
 
+                disc_optimizer.zero_grad()
                 noise = torch.rand(size=(self.batch_size, gen.latent_space_size, 1, 1))
                 generated: torch.Tensor = gen(noise)
                 disc_input = torch.cat((data.to(gen.device), generated))
@@ -238,6 +240,8 @@ class GANTrainer:
                 disc_loss.backward(disc_loss)
                 disc_optimizer.step()
 
+                gen_optimizer.zero_grad()
+                generated: torch.Tensor = gen(noise)
                 disc_output = disc(generated).view(-1)
                 gen_loss: torch.Tensor = criterion(
                     disc_output,
@@ -247,9 +251,6 @@ class GANTrainer:
                 )
                 gen_loss.backward(gen_loss)
                 gen_optimizer.step()
-
-                disc_optimizer.zero_grad()
-                gen_optimizer.zero_grad()
 
                 total_disc_loss += disc_loss.mean().item()
                 total_gen_loss += gen_loss.mean().item()
@@ -309,9 +310,9 @@ def demo_generator(gen: Generator):
     with torch.no_grad():
         while True:
             noise = torch.rand(size=(1, gen.latent_space_size, 1, 1))
-            fake: torch.Tensor = gen(noise).cpu().squeeze(dim=0).long()
+            fake: torch.Tensor = gen(noise).cpu().squeeze(dim=0)
             fake = fake.transpose(0, 1).transpose(1, 2).numpy()
-            plt.imshow(fake)
+            plt.imshow(fake * 255)
             plt.show()
             breakpoint()
 
@@ -320,7 +321,7 @@ def main():
     generator = Generator()
     discriminator = Discriminator()
     trainer = GANTrainer()
-    trainer.train(generator, discriminator, 2)
+    trainer.train(generator, discriminator, 80)
     demo_generator(generator)
 
 
