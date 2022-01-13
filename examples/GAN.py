@@ -81,26 +81,42 @@ class Generator(nn.Module):
             ),
             nn.BatchNorm2d(self.feature_map_size * 4),
             nn.LeakyReLU(negative_slope=0.02),
+            nn.Dropout(0.1),
             # state size (batch_size, feature_map_size * 16, 4, 4)
-            nn.ConvTranspose2d(
+            nn.Upsample(scale_factor=2, mode="bilinear"),
+            nn.Conv2d(
                 self.feature_map_size * 4,
                 self.feature_map_size * 2,
-                4,
-                2,
-                1,
+                kernel_size=5,
+                padding="same",
+                dilation=1,
                 bias=False,
             ),
             nn.BatchNorm2d(self.feature_map_size * 2),
             nn.LeakyReLU(negative_slope=0.02),
+            nn.Dropout(0.1),
             # state size (batch_size, feature_map_size * 8, 8, 8)
-            nn.ConvTranspose2d(
-                self.feature_map_size * 2, self.feature_map_size, 4, 2, 1, bias=False,
+            nn.Upsample(scale_factor=2, mode="bilinear"),
+            nn.Conv2d(
+                self.feature_map_size * 2,
+                self.feature_map_size,
+                kernel_size=5,
+                padding="same",
+                dilation=1,
+                bias=False,
             ),
             nn.BatchNorm2d(self.feature_map_size),
             nn.LeakyReLU(negative_slope=0.02),
+            nn.Dropout(0.1),
             # state size (batch_size, feature_map_size * 4, 16, 16)
-            nn.ConvTranspose2d(
-                self.feature_map_size, self.color_channel_size, 4, 2, 1, bias=False,
+            nn.Upsample(scale_factor=2, mode="bilinear"),
+            nn.Conv2d(
+                self.feature_map_size,
+                self.color_channel_size,
+                kernel_size=5,
+                padding="same",
+                dilation=1,
+                bias=False,
             ),
             # state size (batch_size, feature_map_size * 2, 32, 32)
             nn.Sigmoid(),
@@ -157,8 +173,8 @@ class Discriminator(nn.Module):
             nn.Dropout(0.1),
             # state size (batch_size, feature_map_size * 4, 4, 4)
             nn.Conv2d(self.feature_map_size * 4, 1, 4, 1, 0, bias=False),
-            nn.Sigmoid(),
             # output size (batch_size, 1, 1, 1)
+            nn.Sigmoid(),
         )
 
 
@@ -167,15 +183,20 @@ class GANTrainer:
     workers = 4
     batch_size = 64
     image_size = 128
-    lr = 0.0002
+    lr = 0.00005
     beta1 = 0.5
     beta2 = 0.999
     fake_label = 0
     real_label = 1
+    weight_clipping_limit = 1
     writer = SummaryWriter("/home/adm1n/Shop/logs")
 
     def __init__(self):
         self.dataset = CIFAR100Dataset()
+
+    def clip_weights(self, module: nn.Module):
+        for weight in module.parameters():
+            weight.data.clamp_(-self.weight_clipping_limit, self.weight_clipping_limit)
 
     def train(self, gen: Generator, disc: Discriminator, num_epochs: int = 100):
         data_loader = self.dataset.get_loader(
@@ -197,14 +218,14 @@ class GANTrainer:
             batch_progress_bar = tqdm.tqdm(data_loader)
             for batch_iter, data in enumerate(batch_progress_bar):
                 data = data[0]
-                disc_optimizer.zero_grad()
-                gen_optimizer.zero_grad()
-                noise = torch.rand(size=(self.batch_size, gen.latent_space_size, 1, 1))
+                # self.clip_weights(disc)
+                # self.clip_weights(gen)
+                noise = torch.rand(size=(data.size(0), gen.latent_space_size, 1, 1))
                 with torch.no_grad():
                     generated: torch.Tensor = gen(noise)
 
                 target_real = [self.real_label] * data.size(0)
-                target_fake = [self.fake_label] * self.batch_size
+                target_fake = [self.fake_label] * data.size(0)
 
                 disc_fake = disc(generated.to(disc.device)).view(-1)
                 target = torch.FloatTensor(target_fake).to(disc.device)
@@ -219,8 +240,8 @@ class GANTrainer:
 
                 generated: torch.Tensor = gen(noise)
                 disc_fake = disc(generated.to(disc.device)).view(-1)
-                target = torch.FloatTensor([self.real_label] * self.batch_size)
-                gen_loss = criterion(disc_fake, target.to(disc.device))
+                target = torch.FloatTensor(target_real).to(disc.device)
+                gen_loss = criterion(disc_fake, target)
                 gen_loss.backward(gen_loss)
                 gen_optimizer.step()
 
@@ -296,7 +317,7 @@ def main():
     generator = Generator()
     discriminator = Discriminator()
     trainer = GANTrainer()
-    trainer.train(generator, discriminator, 60)
+    trainer.train(generator, discriminator, 600)
     demo_generator(generator)
 
 
